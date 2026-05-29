@@ -12,7 +12,7 @@ Proyek ini merupakan implementasi pendekatan hybrid antara **Algoritma Genetika 
 ## 📌 Deskripsi Program
 
 Program membaca 8 variabel makroekonomi sebagai fitur input, kemudian menjalankan pipeline berikut:
-
+ 
 1. Generate / load data makroekonomi (inflasi, suku bunga BI, Fed Rate, harga minyak, cadangan devisa, neraca perdagangan, IHSG, harga emas)
 2. Melatih **baseline Random Forest** dengan hyperparameter default sebagai pembanding
 3. Menjalankan **Algoritma Genetika** (50 generasi, populasi 30) untuk mencari kombinasi hyperparameter RF yang optimal
