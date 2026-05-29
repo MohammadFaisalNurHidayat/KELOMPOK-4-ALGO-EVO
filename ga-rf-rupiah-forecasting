@@ -1,0 +1,287 @@
+import sys
+import numpy as np
+import pandas as pd
+import pygad
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend; ganti ke "TkAgg" jika mau GUI
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── Mode: --fast untuk testing cepat ──────────────────────
+FAST_MODE = "--fast" in sys.argv
+if FAST_MODE:
+    print("[INFO] FAST MODE aktif: 10 generasi, pop=15, cv=2")
+
+# ─────────────────────────────────────────────────────────
+# FASE 2.1 — DATA DUMMY MAKROEKONOMI
+# ─────────────────────────────────────────────────────────
+def generate_macro_data(n_samples=300, seed=42):
+    """
+    Simulasi dataset makroekonomi bulanan berbasis teori ekonomi:
+    - PPP (Purchasing Power Parity): inflasi diferensial → kurs
+    - Interest Rate Parity: selisih suku bunga → capital flow → kurs
+    - Current Account: neraca dagang surplus → supply USD → apresiasi Rupiah
+    """
+    rng = np.random.default_rng(seed)
+    base = 17600.0
+
+    inflasi_id    = rng.uniform(2.0, 6.0, n_samples)
+    suku_bunga_bi = rng.uniform(5.0, 7.0, n_samples)
+    fed_rate      = rng.uniform(4.0, 5.5, n_samples)
+    harga_minyak  = rng.uniform(70, 95, n_samples)
+    cad_devisa    = rng.uniform(130, 150, n_samples)
+    neraca_dagang = rng.uniform(-3.0, 4.0, n_samples)
+    ihsg          = rng.uniform(6.0, 8.0, n_samples)
+    harga_emas    = rng.uniform(1800, 2400, n_samples)
+    noise         = rng.normal(0, 150, n_samples)
+
+    kurs = (
+        base
+        + 200  * (inflasi_id - 4.0)
+        + 350  * (fed_rate - 4.75)
+        - 250  * (suku_bunga_bi - 6.0)
+        - 80   * (harga_minyak - 80)
+        - 100  * (cad_devisa - 140)
+        - 200  * neraca_dagang
+        - 30   * (ihsg - 7.0)
+        + 0.5  * (harga_emas - 2100)
+        + noise
+    )
+
+    X = np.column_stack([
+        inflasi_id, suku_bunga_bi, fed_rate, harga_minyak,
+        cad_devisa, neraca_dagang, ihsg, harga_emas
+    ])
+    feature_names = [
+        "inflasi_id", "suku_bunga_bi", "fed_rate", "harga_minyak",
+        "cad_devisa", "neraca_dagang", "ihsg", "harga_emas"
+    ]
+    return X, kurs, feature_names
+
+
+# ─────────────────────────────────────────────────────────
+# FASE 2.2 — REPRESENTASI KROMOSOM (GENE SPACE)
+# ─────────────────────────────────────────────────────────
+"""
+Kromosom = [n_estimators, max_depth, min_samples_split, min_samples_leaf, max_features]
+Semua gen bertipe kontinu; decode ke int di dalam fitness function.
+"""
+GENE_SPACE = [
+    {"low": 50,  "high": 500},   # Gen 0: n_estimators
+    {"low": 2,   "high": 30},    # Gen 1: max_depth
+    {"low": 2,   "high": 20},    # Gen 2: min_samples_split
+    {"low": 1,   "high": 10},    # Gen 3: min_samples_leaf
+    {"low": 0.3, "high": 1.0},   # Gen 4: max_features (float)
+]
+
+# Global state
+X_TRAIN_G, Y_TRAIN_G = None, None
+fitness_log = []
+CV_FOLDS = 2 if FAST_MODE else 3
+
+
+# ─────────────────────────────────────────────────────────
+# FASE 2.3 — FITNESS FUNCTION
+# ─────────────────────────────────────────────────────────
+def fitness_fn(ga_instance, solution, solution_idx):
+    """
+    Fitness = 1 / (1 + CV-RMSE)
+    Higher fitness = lower RMSE = better generalization
+    """
+    hp = decode_chromosome(solution)
+    rf = RandomForestRegressor(**hp, random_state=42, n_jobs=-1)
+    scores = cross_val_score(
+        rf, X_TRAIN_G, Y_TRAIN_G,
+        cv=CV_FOLDS, scoring="neg_root_mean_squared_error", n_jobs=-1
+    )
+    rmse = -np.mean(scores)
+    return 1.0 / (1.0 + rmse)
+
+
+def decode_chromosome(solution):
+    """Konversi vektor gen float → dict hyperparameter RF yang valid."""
+    return {
+        "n_estimators":      int(np.clip(round(solution[0]), 50, 500)),
+        "max_depth":         int(np.clip(round(solution[1]), 2, 30)),
+        "min_samples_split": int(np.clip(round(solution[2]), 2, 20)),
+        "min_samples_leaf":  int(np.clip(round(solution[3]), 1, 10)),
+        "max_features":      float(np.clip(solution[4], 0.3, 1.0)),
+    }
+
+
+def on_gen(ga_instance):
+    """Callback: log fitness terbaik setiap generasi."""
+    best_sol, best_fit, _ = ga_instance.best_solution()
+    fitness_log.append(best_fit)
+    hp = decode_chromosome(best_sol)
+    rmse_est = 1 / best_fit - 1
+    gen = ga_instance.generations_completed
+    print(
+        f"[Gen {gen:03d}] Fitness={best_fit:.6f} | CV-RMSE≈{rmse_est:.1f} | "
+        f"n_est={hp['n_estimators']}, depth={hp['max_depth']}, "
+        f"feat={hp['max_features']:.3f}"
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# FASE 3.1 — PARAMETER EVOLUSI
+# ─────────────────────────────────────────────────────────
+def build_ga(fast=False):
+    return pygad.GA(
+        num_generations    = 10 if fast else 50,
+        num_parents_mating = 6  if fast else 10,
+        sol_per_pop        = 15 if fast else 30,
+        num_genes          = len(GENE_SPACE),
+        gene_space         = GENE_SPACE,
+        parent_selection_type = "tournament",
+        crossover_type        = "single_point",
+        crossover_probability = 0.85,
+        mutation_type         = "random",
+        mutation_probability  = 0.15,
+        keep_elitism          = 2,
+        random_seed           = 42,
+        fitness_func          = fitness_fn,
+        on_generation         = on_gen,
+        suppress_warnings     = True,
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# VISUALISASI (FASE 3.2)
+# ─────────────────────────────────────────────────────────
+def plot_all(y_test, y_pred_b, y_pred_o, feature_names, rf_opt,
+             rmse_b, rmse_o, mape_b, mape_o, out="ga_rf_results.png"):
+    fig = plt.figure(figsize=(16, 11))
+    fig.suptitle(
+        "Hybrid GA + Random Forest — Prediksi Kurs USD/IDR\n"
+        "Evolusi Cerdas untuk Ketahanan Ekonomi",
+        fontsize=14, fontweight="bold"
+    )
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.33)
+
+    # Panel 1 — Fitness Convergence
+    ax1 = fig.add_subplot(gs[0, 0])
+    gens = list(range(1, len(fitness_log) + 1))
+    ax1.plot(gens, fitness_log, "#2E86AB", lw=2, marker="o", ms=3)
+    ax1.fill_between(gens, fitness_log[0], fitness_log, alpha=0.15, color="#2E86AB")
+    ax1.axhline(fitness_log[-1], color="red", ls="--", lw=1, alpha=0.7,
+                label=f"Final: {fitness_log[-1]:.5f}")
+    ax1.set(xlabel="Generasi", ylabel="Fitness (1/(1+RMSE))",
+            title="Konvergensi Fitness GA")
+    ax1.legend(fontsize=9); ax1.grid(alpha=0.3)
+
+    # Panel 2 — Prediction vs Actual
+    ax2 = fig.add_subplot(gs[0, 1])
+    idx = range(len(y_test))
+    ax2.plot(idx, y_test, "k-", lw=2, label="Aktual", alpha=0.8)
+    ax2.plot(idx, y_pred_b, "--", color="#E63946", lw=1.5,
+             label=f"Baseline (RMSE={rmse_b:.0f})", alpha=0.8)
+    ax2.plot(idx, y_pred_o, "-",  color="#2A9D8F", lw=1.5,
+             label=f"GA-Optimal (RMSE={rmse_o:.0f})")
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"Rp{x:,.0f}"))
+    ax2.set(xlabel="Sample Index (Test Set)", ylabel="Kurs USD/IDR",
+            title="Prediksi vs Aktual Kurs Rupiah")
+    ax2.legend(fontsize=9); ax2.grid(alpha=0.3)
+
+    # Panel 3 — Residuals
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.scatter(idx, y_test - y_pred_b, color="#E63946", alpha=0.5, s=20, label="Baseline")
+    ax3.scatter(idx, y_test - y_pred_o, color="#2A9D8F", alpha=0.7, s=20, label="GA-Optimal")
+    ax3.axhline(0, color="k", lw=1.5)
+    ax3.set(xlabel="Sample Index", ylabel="Residual (IDR)",
+            title="Residual Plot (Aktual − Prediksi)")
+    ax3.legend(fontsize=9); ax3.grid(alpha=0.3)
+
+    # Panel 4 — Feature Importance
+    ax4 = fig.add_subplot(gs[1, 1])
+    imp = rf_opt.feature_importances_
+    sidx = np.argsort(imp)[::-1]
+    clrs = ["#2E86AB" if i==0 else "#A8DADC" for i in range(len(feature_names))]
+    bars = ax4.bar([feature_names[i] for i in sidx], imp[sidx],
+                   color=clrs, edgecolor="white")
+    for b, v in zip(bars, imp[sidx]):
+        ax4.text(b.get_x()+b.get_width()/2, b.get_height()+0.003,
+                 f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+    ax4.set(xlabel="Fitur", ylabel="Importance (MDI)",
+            title="Feature Importance — Model GA-Optimal")
+    ax4.tick_params(axis="x", rotation=30, labelsize=9)
+    ax4.grid(axis="y", alpha=0.3)
+
+    plt.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
+    print(f"\n[PLOT] Disimpan ke: {out}")
+    plt.close()
+
+
+# ─────────────────────────────────────────────────────────
+# MAIN PIPELINE
+# ─────────────────────────────────────────────────────────
+def main():
+    global X_TRAIN_G, Y_TRAIN_G
+
+    print("=" * 65)
+    print("  HYBRID GA + RANDOM FOREST — PREDIKSI KURS USD/IDR")
+    print(f"  Mode: {'FAST (testing)' if FAST_MODE else 'FULL (50 generasi)'}")
+    print("=" * 65)
+
+    # 1. Data
+    X, y, feat = generate_macro_data(n_samples=300)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=False
+    )
+    X_TRAIN_G, Y_TRAIN_G = X_tr, y_tr
+    print(f"\n[DATA] Train={X_tr.shape}, Test={X_te.shape}")
+    print(f"[DATA] Kurs range: {y.min():.0f}–{y.max():.0f} IDR/USD\n")
+
+    # 2. Baseline RF
+    print("─" * 65)
+    rf_b = RandomForestRegressor(random_state=42, n_jobs=-1)
+    rf_b.fit(X_tr, y_tr)
+    rmse_b = np.sqrt(mean_squared_error(y_te, rf_b.predict(X_te)))
+    mape_b = mean_absolute_percentage_error(y_te, rf_b.predict(X_te)) * 100
+    print(f"[BASELINE] RMSE={rmse_b:.2f} | MAPE={mape_b:.4f}%")
+
+    # 3. Jalankan GA
+    print("\n" + "─" * 65)
+    print("[GA] Memulai evolusi...\n")
+    ga = build_ga(fast=FAST_MODE)
+    ga.run()
+
+    # 4. Decode hasil terbaik
+    best_sol, best_fit, _ = ga.best_solution()
+    best_hp = decode_chromosome(best_sol)
+    print(f"\n[GA SELESAI] Best fitness: {best_fit:.6f} | CV-RMSE≈{1/best_fit-1:.2f}")
+    print("[BEST HP]", best_hp)
+
+    # 5. Retrain model final
+    rf_o = RandomForestRegressor(**best_hp, random_state=42, n_jobs=-1)
+    rf_o.fit(X_tr, y_tr)
+    y_pred_b = rf_b.predict(X_te)
+    y_pred_o = rf_o.predict(X_te)
+    rmse_o = np.sqrt(mean_squared_error(y_te, y_pred_o))
+    mape_o = mean_absolute_percentage_error(y_te, y_pred_o) * 100
+
+    # 6. Summary
+    print("\n" + "=" * 65)
+    print(f"  {'Metrik':<15} {'Baseline':>12} {'GA-Optimal':>12} {'Δ%':>10}")
+    print("  " + "-" * 51)
+    di_rmse = (rmse_b - rmse_o) / rmse_b * 100
+    di_mape = (mape_b - mape_o) / mape_b * 100
+    print(f"  {'RMSE (IDR)':<15} {rmse_b:>12.2f} {rmse_o:>12.2f} {di_rmse:>9.2f}%")
+    print(f"  {'MAPE (%)':<15} {mape_b:>12.4f} {mape_o:>12.4f} {di_mape:>9.2f}%")
+    print("=" * 65)
+
+    # 7. Plot
+    plot_all(y_te, y_pred_b, y_pred_o, feat, rf_o,
+             rmse_b, rmse_o, mape_b, mape_o)
+
+    return best_hp, ga
+
+
+if __name__ == "__main__":
+    main()
